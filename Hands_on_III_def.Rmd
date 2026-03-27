@@ -1,0 +1,496 @@
+---
+title: "my title"
+author: "David Fragoso (david.fragoso01@estudiant.upf.edu), Marta Sotelo (marta.sotelo01@estudiant.upf.edu)"
+date: "Last update: `r format(Sys.time(), '%d %B, %Y')`"      
+output:
+  html_document:
+    toc: true
+    fig_caption: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Setup
+
+```{r}
+suppressPackageStartupMessages({
+  library(mice)
+  library(randomForest)
+  library(readxl)
+  library(pROC)
+  library(ggplot2)
+  library(dplyr)
+  library(pheatmap)
+  library(caret)
+})
+```
+
+```{r}
+# obtaining data
+setwd("/home/marta/Desktop/DMI/assignment_3_msotmon/data/raw_data")
+list.files()
+# use local path
+# path <- "Supplementary table 1.xlsx"
+ST1 <- readxl::read_xlsx("table1.xlsx", sheet = "Clinical_information")
+ST3 <- readxl::read_xlsx("table3.xlsx", sheet = "Prot_and_meta_matrix")
+ST4 <- readxl::read_xlsx("table4.xlsx", sheet = "Prot_and_meta_matrix")
+ST5 <- readxl::read_xlsx("table5.xlsx", sheet = "Prot_and_meta_matrix")
+```
+
+# Exercise 1
+
+**Build a Random Forest model to classify COVID-19 severity**
+
+*Using the training cohort provided in Supplementary Table 3, build a Random Forest classification model similar to the one in the publication to distinguish between non-Severe and Severe COVID-19 patients.*
+
+*Report the following performance metrics from cross-validation:*
+
+-   *Confusion matrix*\
+-   *Accuracy*\
+-   *ROC curve and AUC*
+
+*How well does the Random Forest model separate non-Severe from Severe patients based on proteomic profiles?*
+
+#### Getting the information of the patient ID and their respective group.
+
+```{r}
+# making a metadata df with only the info that we're interested in
+metadata <- data.frame(Patient_ID = ST1$`Patient ID a`)
+metadata$Group <- factor(ST1$`Group d`, 
+                         levels = c(0, 1, 2, 3), 
+                         labels = c("Healthy Control", 
+                                    "Non-COVID-19", 
+                                    "Non-severe", 
+                                    "Severe"))
+
+# Getting only the Severe and non-severe samples
+COVID_metadata <- metadata[metadata$Group %in% c("Non-severe", "Severe"), ]
+
+# Filter for the Training (C1) cohort and COVID-19 groups only (Groups 2 & 3)
+# The study uses 37 non-severe and 28 severe patients for training
+COVID_metadata <- metadata[ST1$`COVID-19 patients corhort` == "Training (C1)" & 
+                           metadata$Group %in% c("Non-severe", "Severe"), ]
+```
+
+#### Processing the proteomic data matrix
+
+```{r}
+# Prepare the molecular Feature Matrix (transforming into a data frame)
+matrix_data <- data.frame(ST3)
+
+# Remove all "Metabolites" rows to leave only the Protein features
+matrix_data <- matrix_data[matrix_data$Gene.Symbol != "NA", ]
+
+# Use the column with the Proteins' ID as row names
+rownames(matrix_data) <- matrix_data[,1]
+# Remove ID and Gene Symbol columns to keep only patient data
+feature_data <- matrix_data[, -c(1, 2)]
+
+# Transpose: Patients must be rows for Random Forest
+feature_data <- as.data.frame(t(feature_data))
+
+
+# Align the matrix with our filtered COVID metadata:
+## Only keep patients present in our training subset
+train_features <- feature_data[rownames(feature_data) %in% COVID_metadata$Patient_ID, ]
+
+## Making it so the rownames from the training features match the order in the metadata
+train_labels <- COVID_metadata[match(rownames(train_features), COVID_metadata$Patient_ID), ]
+train_labels$Group <- droplevels(train_labels$Group)
+
+sum(rownames(train_features) != train_labels$Patient_ID) # Checking how many rownames and columns DON'T match
+```
+
+#### Removing/inputting Missing values from the training features:
+
+```{r}
+sum(is.na(train_features)) # We start with this amount of NAs
+
+# Checking percent of missing values per every column
+prots_NA <- colMeans(is.na(train_features)) * 100 
+
+# Removing Proteins and samples which have over X% of missing data
+X = 20
+train_features_filtered <- train_features[prots_NA <= X]
+sum(is.na(train_features_filtered)) # We end with this amount of NAs
+```
+
+We removed all those genes that have over 20% of missing values. By doing this we can greatly reduce the number of missing values that we'll need to input.
+
+```{r}
+# Inputing the rest of the NAs with MICE (CAREFUL, REALLY LONG TO RUN)
+# mice_imputed <- mice(
+#   train_features,
+#   m = 1,
+#   maxit = 1,
+#   method = "pmm",
+#   seed = 123
+# )
+# train_features_final <- complete(mice_imputed)
+
+
+# Input using median (filling the gaps using the median of the columns)
+train_features_final <- as.data.frame(apply(train_features_filtered, 2, function(x) {
+  # Replace NAs with the median of that specific column
+  x[is.na(x)] <- median(x, na.rm = TRUE)
+  return(x)
+}))
+
+
+sum(is.na(train_features_final)) # Should be 0
+```
+
+#### Training the model
+
+```{r}
+# 1. Set seed for reproducibility
+set.seed(45)
+
+# 2. Define the Cross-Validation settings
+# method = "cv" tells caret to do K-fold
+# number = 5 sets it to 5 groups
+# classProbs = TRUE allows us to calculate AUC later
+# savePredictions = "final" keeps the test results from each fold
+train_control <- trainControl(method = "repeatedcv", 
+                              number = 10, 
+                              repeats = 100,
+                              classProbs = TRUE, 
+                              summaryFunction = twoClassSummary, # Necessary for AUC
+                              savePredictions = "final",
+                              )
+
+# 3. Run the Cross-Validation
+# We use 'train' from caret, which wraps around the randomForest function
+rf_model <- train(x = train_features_final, 
+                  y = make.names(train_labels$Group), 
+                  method = "rf", 
+                  ntree = 1000,
+                  metric = "ROC", # Optimize for the best AUC
+                  trControl = train_control,
+                  nodesize = 5,
+                  importance = TRUE)
+
+rf_model
+```
+
+#### Results:
+
+```{r}
+# 1. Confusion Matrix and accuracy
+confusionMatrix(rf_model)
+
+
+# 2. ROC Curve and AUC
+# Get the probability of being in the "Severe" class
+cv_predictions <- rf_model$pred
+
+# Calculate the ROC object
+cv_roc <- roc(cv_predictions$obs, cv_predictions$Severe)
+
+# Print the AUC
+print(paste("AUC:", round(auc(cv_roc), 4)))
+
+```
+
+The cross-validated accuracy of 80.71% indicates a solid predictive foundation. Looking at the confusion matrix, our model correctly identifies Non-severe patients (51.8%) more reliably than Severe patients (28.9%). The "Severe" prediction has a higher error rate (13.1% false negatives vs. 6.2% false positives), suggesting the proteomic signature of some severe cases may overlap with non-severe profiles in your specific training iteration.
+
+```{r}
+# Plot ROC curve
+plot(cv_roc, 
+     main = "ROC Curve: 5-Fold Cross-Validation", 
+     col = "#2c7fb8",   # Professional blue
+     lwd = 4,           # Line thickness
+     legacy.axes = TRUE, # Starts X-axis at 0
+     percent = FALSE)
+
+# Add the diagonal reference line
+abline(a = 0, b = 1, lty = 2, col = "gray")
+
+# Add the AUC value as text on the plot
+text(0.4, 0.2, labels = paste("AUC =", round(auc(cv_roc), 3)), 
+     cex = 1.2, font = 2, col = "#2c7fb8")
+```
+
+An AUC of 0.92 indicates an outstanding ability of the model to distinguish between severe and non-severe patients, with a 92% probability of correctly classifying a random individual.
+
+\
+
+# Exercise 2
+
+**Identify and interpret the most important features**
+
+*Using the trained Random Forest model from Exercise 1, identify the 25 most important protein features contributing to the classification. Disccus their biological relevance.*
+
+*Compare your selected features to the proteins reported by the authors in Supplementary Table 5.*
+
+#### Exctracting the top 25 most important biomarkers
+
+```{r}
+# 1. Extract importance scores from the CV model
+importance_df <- varImp(rf_model)$importance
+importance_df$Feature <- rownames(importance_df)
+
+# 2. Identify the correct column for sorting
+imp_column <- ifelse("MeanDecreaseGini" %in% colnames(importance_df), 
+                     "MeanDecreaseGini", 
+                     colnames(importance_df)[1])
+
+# 3. Sort and select the top 25
+top_25_data <- importance_df %>%
+  rename(Importance = !!sym(imp_column)) %>% # Temporarily rename for easier plotting
+  arrange(desc(Importance)) %>%
+  head(25)
+
+# 4. Create the Barplot
+ggplot(top_25_data, aes(x = reorder(Feature, Importance), y = Importance)) +
+  geom_bar(stat = "identity", fill = "#3182bd") +
+  coord_flip() + 
+  theme_minimal() +
+  labs(title = "Top 25 Most Important Biomarkers",
+       subtitle = paste("Based on", imp_column),
+       x = "Proteins",
+       y = "Importance Score")
+```
+
+P0DJI9: Immunoglobulin lambda variable region Part of antibody light chains; contributes to antigen recognition and adaptive immune responses.
+
+P02750: Leucine-rich alpha-2-glycoprotein (LRG1) Secreted glycoprotein involved in angiogenesis and inflammatory signaling; often elevated in inflammatory diseases and cancers.
+
+P02748: Complement component C9 Terminal component of the complement cascade; forms the membrane attack complex (MAC) that lyses pathogens.
+
+P01019: Angiotensinogen Precursor of angiotensin peptides that regulate blood pressure, fluid balance, and cardiovascular homeostasis.
+
+P80108: Lipopolysaccharide-binding protein (LBP) Binds bacterial LPS and enhances innate immune responses by presenting endotoxin to CD14/TLR4 receptors.
+
+P01009: Alpha-1-antitrypsin (SERPINA1) A serine protease inhibitor that protects tissues from enzymes released during inflammation, particularly neutrophil elastase.
+
+P02768: Serum albumin The most abundant plasma protein, responsible for transport of metabolites, drugs, fatty acids, and maintaining oncotic pressure.
+
+P5188: Lumican Extracellular matrix proteoglycan involved in collagen fibril organization, tissue structure, and wound healing.
+
+Q14520: Hyaluronan-binding protein 2 (HABP2 / Factor VII activating protease) Protease involved in coagulation, fibrinolysis, and extracellular matrix remodeling.
+
+O00187: Mannan-binding lectin serine protease 2 (MASP-2) Key enzyme of the lectin pathway of complement activation, contributing to innate immunity.
+
+P04275: von Willebrand factor (VWF) Large glycoprotein essential for platelet adhesion and blood coagulation.
+
+P01011: Alpha-1-antichymotrypsin (SERPINA3) Acute-phase protease inhibitor involved in inflammatory responses and tissue protection.
+
+P15151: Complement factor B Central component of the alternative complement pathway, participating in pathogen opsonization and immune defense.
+
+P02787: Serotransferrin (Transferrin) Iron-transport protein in blood; critical for iron homeostasis and delivery to cells.
+
+P00751: Complement factor B / or related complement protease fragment (depending on annotation) Participates in complement activation and immune defense.
+
+P02763: Alpha-1-acid glycoprotein 1 (ORM1) Acute-phase plasma protein with immunomodulatory and drug-binding functions.
+
+P04196: Histidine-rich glycoprotein (HRG) Multifunctional plasma protein involved in coagulation, immune regulation, and angiogenesis.
+
+P0DJI8: Immunoglobulin kappa variable region Antibody light-chain variable domain contributing to antigen specificity in adaptive immunity.
+
+P12259: Complement component C5 Central complement protein that generates C5a (potent inflammatory mediator) and C5b for MAC formation.
+
+Q9UK55: Protein AMBP (Alpha-1-microglobulin/bikunin precursor) Precursor producing proteins involved in protease inhibition, oxidative stress protection, and extracellular regulation.
+
+P02741: C-reactive protein (CRP) Major acute-phase inflammatory marker that binds pathogens and activates complement.
+
+P24593: Insulin-like growth factor binding protein 3 (IGFBP3) Regulates IGF signaling, influencing cell growth, metabolism, and apoptosis.
+
+Q96PD5: Possibly secreted regulatory protein (context-dependent) Generally associated with cell signaling or extracellular regulatory processes.
+
+P49747: Complement component C6 Part of the membrane attack complex, contributing to pathogen lysis.
+
+P08571: Monocyte differentiation antigen CD14 Co-receptor for bacterial lipopolysaccharide detection in innate immune signaling.
+
+```{r}
+# 1. Subset the training data for only the top 25 features
+top_features_names <- top_25_data$Feature
+heatmap_matrix <- t(train_features_final[, top_features_names])
+
+# 2. Prepare column annotations (Group: Non-severe vs Severe)
+# This adds the colored bar at the top of the heatmap
+annotation_col <- data.frame(Status = train_labels$Group)
+rownames(annotation_col) <- rownames(train_features_final)
+
+# 3. Define colors for the annotation
+ann_colors = list(
+  Status = c("Non-severe" = "#7fcdbb", "Severe" = "#2c7fb8")
+)
+
+# 4. Generate the Heatmap
+pheatmap(heatmap_matrix, 
+         scale = "row",           # Standardizes features (Z-score)
+         annotation_col = annotation_col, 
+         annotation_colors = ann_colors,
+         clustering_distance_rows = "euclidean", 
+         clustering_method = "ward.D2",
+         show_colnames = FALSE,   # Hide patient IDs for a cleaner look
+         main = "Expression Signature of Top 25 Predictors",
+         color = colorRampPalette(c("navy", "white", "firebrick3"))(100))
+```
+
+#### Comparing against the top25 of the article
+
+```{r}
+# Getting the features that are found to be both the most important for our model classification and are present in the most important features of the paper.
+coinciding_features <- top_features_names[top_features_names %in% ST5$`Proteins/Metabolites`]
+coinciding_features
+```
+
+Obtaining the top features from the top rated ones by the model, and comparing them with the ones provided by the study we can see that 13 of your top features(including P0DJI9 (SAA2), P02741 (CRP), and P02750 (ALB)) coincide exactly with the most important biomarkers reported by the authors. This significant overlap validates the model's performance, confirming it successfully captured the same essential molecular signatures of systemic inflammation and acute phase response found in the original study.
+
+# Exercise 3
+
+**External prediction on an independent test cohort**
+
+*Using the final Random Forest model trained on the full training cohort, predict disease severity for patients in the independent test cohort provided in Supplementary Table 4.*
+
+*Your task is to:*
+
+-   *Apply the trained model to the test cohort.*\
+-   *Obtain predicted probabilities of Severe disease for each patient.*\
+-   *Assign predicted class labels based on these probabilities.*\
+-   *Compare predictions to the true clinical labels.*
+
+*How does the model perform on the independent test cohort?*
+
+#### Getting the metadata for the test patients
+
+```{r}
+# Load and prepare the test cohort metadata 
+test_metadata <- data.frame(Patient_ID = ST1$`Patient ID a`)
+test_metadata$Group <- factor(ST1$`Group d`,
+                              levels = c(0, 1, 2, 3),
+                              labels = c("Healthy Control", "Non-COVID-19",
+                                         "Non-severe", "Severe"))
+
+COVID_test_metadata <- test_metadata[
+  ST1$`COVID-19 patients corhort` == "Test 1 (C2)" &
+  test_metadata$Group %in% c("Non-severe", "Severe"), ]
+
+nrow(COVID_test_metadata)
+```
+
+#### Prepare the freature matrix
+
+```{r}
+# We'll follow the same steps as for the training dataset:
+# Make into a df
+test_matrix <- data.frame(ST4)
+
+# Remove all "Metabolites" rows to leave only the Protein features
+test_matrix[1,1] <- '-'
+test_matrix[1,2] <- '-'
+test_matrix <- test_matrix[test_matrix$Gene.Symbol != "NA", ]
+test_matrix_copy <- test_matrix
+# Use the column with the Proteins' ID as row names
+# test_matrix <- test_matrix_copy[2:nrow(test_matrix_copy),]
+rownames(test_matrix_copy) <- test_matrix_copy[,1]
+# Remove ID and Gene Symbol columns to keep only patient data
+test_data <- test_matrix_copy[, -c(1, 2)]
+
+# Transpose: Patients must be rows for Random Forest
+test_data <- as.data.frame(t(test_data))
+rownames(test_data) <- test_data[,1]
+test_data <- test_data[,2:ncol(test_data)]
+
+
+# Align the matrix with our filtered COVID metadata:
+## Only keep patients present in our training subset
+test_features <- test_data[rownames(test_data) %in% COVID_test_metadata$Patient_ID, ]
+
+## Making it so the rownames from the training features match the order in the metadata
+test_labels <- COVID_test_metadata[match(rownames(test_features), COVID_test_metadata$Patient_ID), ]
+test_labels$Group <- droplevels(test_labels$Group)
+
+sum(rownames(test_features) != test_labels$Patient_ID) # Checking how many rownames and columns DON'T match
+```
+
+#### Align features
+
+Both the training and test sets
+
+```{r}
+# Adding the genes that are not present in the training dataset 
+missing_genes <- colnames(train_features_final)[!colnames(train_features_final) %in% colnames(test_features)]
+
+for(gene in missing_genes) {
+  # Fill with the median value the model learned during training
+  test_features[[gene]] <- median(train_features_final[[gene]], na.rm = TRUE)
+}
+
+
+# Leaving only the genes that were used to train the model
+test_features_aligned <- test_features[, colnames(test_features) %in% colnames(train_features_final)]
+
+# Making them match
+test_features_aligned <- test_features_aligned[, colnames(train_features_final)]
+sum(colnames(train_features_final) != colnames(test_features_aligned))
+```
+
+#### Inputing missing values
+
+```{r}
+# Checking how many missing values are there
+sum(is.na(test_features))
+
+# test_features_final <- apply(test_features_aligned, 2, function(x) {
+#   x[is.na(x)] <- median(x, na.rm = TRUE)
+#   return(x)
+# })
+# test_features_final <- as.data.frame(test_features_final)
+
+```
+
+As there are no missing values, we can proceed without needing to input any data.
+
+#### Generate predictions
+
+```{r}
+# Data frame with the classification of each patient 
+test_preds <- predict(rf_model, test_features, type = "raw")
+# Changing the levels from Non.severe to Non-severe
+test_preds <- as.factor(test_preds)
+levels(test_preds) <- c("Non-severe", "Severe")
+
+# Probability of a patient being severe
+test_probs <- predict(rf_model, test_features, type = "prob")[, "Severe"]
+```
+
+#### Show results
+
+```{r}
+# Create the Confusion Matrix
+# We use the test_labels$Group as the reference
+# test_preds$`Non-severe` <- test_preds$Non.severe
+conf_matrix <- confusionMatrix(test_preds, test_labels$Group)
+print(conf_matrix)
+
+# Calculate and Plot ROC/AUC
+test_roc <- roc(test_labels$Group, test_probs)
+print(paste("Test AUC:", round(auc(test_roc), 4)))
+
+plot(test_roc, col = "#e31a1c", lwd = 3, main = "ROC Curve: Independent Test Set")
+abline(a = 0, b = 1, lty = 2, col = "gray")
+text(0.4, 0.2, paste("AUC =", round(auc(test_roc), 3)), col = "#e31a1c", font = 2)
+```
+
+Accuracy and AUC: It achieved an accuracy of 70% and an AUC of 0.875. While the accuracy is slightly lower than the training phase (80.71%), the high AUC indicates that the model still maintains a strong ability to rank the severity of new patients correctly.
+
+Sensitivity and Specificity: Using "Non-severe" as the positive class, the model reached a sensitivity of 66.67% and a specificity of 75%. This means it was slightly better at identifying the non-severe cases than the severe ones in this specific small batch.
+
+Reliability: The Balanced Accuracy of % suggests the model is not simply biased toward the most frequent class (Prevalence 60%) but is genuinely identifying molecular differences.
+
+Generalization: Despite the small test size, the fact that 13 of our top predictors (like SAA2, CRP, and ALB) are shared with the original study's high-importance list explains why the model remains effective on external data.
+
+```{r}
+class(test_preds)
+```
+
+# session info {.unnumbered}
+
+```{r, results='asis',  echo=FALSE, message=FALSE }
+sessionInfo()
+```
